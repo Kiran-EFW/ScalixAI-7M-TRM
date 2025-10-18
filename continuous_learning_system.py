@@ -165,6 +165,21 @@ class ContinuousLearningOrchestrator:
         """Execute one complete learning cycle"""
         logger.info(f"Starting learning cycle {cycle_count}")
 
+        # SAFETY CHECK: Verify we're not approaching API limits
+        if hasattr(self, 'data_generator') and hasattr(self.data_generator, 'api'):
+            rate_status = self.data_generator.api.get_rate_limit_status()
+
+            # Emergency stop if too close to daily limit
+            if rate_status.get('day_requests', 0) >= self.data_generator.api.config.rate_limit.requests_per_day * 0.8:
+                logger.warning("🚨 EMERGENCY: Approaching 80% of daily API limit. Pausing learning to prevent bans.")
+                logger.warning("Learning will resume automatically tomorrow or when limits reset.")
+                self.stop_event.wait(3600)  # Wait 1 hour before checking again
+                return
+
+            # Warning if approaching hourly limit
+            if rate_status.get('hour_requests', 0) >= self.data_generator.api.config.rate_limit.requests_per_hour * 0.7:
+                logger.warning("⚠️  CAUTION: Approaching 70% of hourly API limit. Reducing activity.")
+
         # 1. Multi-agent learning and communication
         if self.multi_agent_coordinator:
             self.multi_agent_coordinator._learning_cycle()
@@ -194,6 +209,9 @@ class ContinuousLearningOrchestrator:
 
         # 5. Update learning statistics
         self._update_learning_statistics()
+
+        # 6. Aggressive storage cleanup after each cycle
+        self._cleanup_after_cycle()
 
         logger.info(f"Completed learning cycle {cycle_count}")
 
@@ -225,8 +243,20 @@ class ContinuousLearningOrchestrator:
 
                     self.learning_stats["knowledge_items_generated"] += len(examples)
 
-                # Wait before next generation cycle
-                self.stop_event.wait(1800)  # 30 minutes
+                # Wait before next generation cycle (respect rate limits)
+                rate_status = self.data_generator.api.get_rate_limit_status()
+
+                # If approaching limits, wait longer
+                if rate_status.get('hour_requests', 0) > 500:  # Half of hourly limit
+                    wait_time = 3600  # 1 hour
+                    logger.info(f"Approaching hourly limits. Waiting {wait_time/3600:.1f} hours.")
+                elif rate_status.get('day_requests', 0) > 2000:  # 40% of daily limit
+                    wait_time = 7200  # 2 hours
+                    logger.info(f"Approaching daily limits. Waiting {wait_time/3600:.1f} hours.")
+                else:
+                    wait_time = 3600  # 1 hour (more conservative than 30 minutes)
+
+                self.stop_event.wait(wait_time)
 
             except Exception as e:
                 logger.error(f"Data generation error: {e}")
@@ -404,6 +434,25 @@ class ContinuousLearningOrchestrator:
                     translated = knowledge_base.translate_knowledge(concept_id, target_lang)
                     if translated:
                         logger.info(f"Expanded concept {concept_id} to {target_lang}")
+
+    def _cleanup_after_cycle(self):
+        """Perform aggressive cleanup after each learning cycle"""
+        try:
+            from storage_manager import StorageManager
+
+            storage_manager = StorageManager(max_storage_gb=10.0)  # More aggressive limit
+
+            # Run immediate cleanup
+            cleanup_results = storage_manager.optimize_storage()
+
+            if cleanup_results["files_deleted"] > 0 or cleanup_results["files_compressed"] > 0:
+                space_saved_mb = cleanup_results["space_saved_bytes"] / (1024 * 1024)
+                logger.info(f"Cycle cleanup: {cleanup_results['files_deleted']} files deleted, "
+                          f"{cleanup_results['files_compressed']} compressed, "
+                          f"{space_saved_mb:.1f} MB saved")
+
+        except Exception as e:
+            logger.warning(f"Failed to perform cycle cleanup: {e}")
 
     def _update_learning_statistics(self):
         """Update comprehensive learning statistics"""

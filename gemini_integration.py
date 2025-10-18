@@ -5,27 +5,174 @@ Gemini 2.5 Flash API Integration for Training Data Generation
 import os
 import json
 import time
+import threading
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
+from collections import deque
+from datetime import datetime, timedelta
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 @dataclass
+class RateLimitConfig:
+    """Configuration for API rate limiting to prevent bans"""
+    requests_per_minute: int = 20  # Very conservative (Gemini allows ~60/min)
+    requests_per_hour: int = 500   # Very conservative (well below Gemini's limits)
+    requests_per_day: int = 2000   # Very conservative daily limit for continuous learning
+    tokens_per_minute: int = 50000  # Conservative token limit
+    burst_limit: int = 3  # Allow very short bursts
+    cooldown_period: int = 300  # 5 minutes wait after rate limit hit
+
+@dataclass
 class GeminiConfig:
     api_key: str
-    model: str = "gemini-2.0-flash-exp"
+    model: str = "gemini-2.0-flash-thinking-exp"
     base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     max_retries: int = 3
     retry_delay: float = 1.0
     request_timeout: int = 60
+    rate_limit: RateLimitConfig = None
+
+    def __post_init__(self):
+        if self.rate_limit is None:
+            self.rate_limit = RateLimitConfig()
+
+class RateLimiter:
+    """Advanced rate limiter to prevent API bans"""
+
+    def __init__(self, config: RateLimitConfig):
+        self.config = config
+        self.lock = threading.Lock()
+
+        # Request tracking
+        self.minute_requests = deque(maxlen=config.requests_per_minute * 2)
+        self.hour_requests = deque(maxlen=config.requests_per_hour * 2)
+        self.day_requests = deque(maxlen=config.requests_per_day * 2)
+
+        # Token tracking (rough estimate)
+        self.minute_tokens = deque(maxlen=config.tokens_per_minute * 2)
+
+        # Cooldown tracking
+        self.last_rate_limit_hit = None
+        self.cooldown_until = None
+
+        # Burst tracking
+        self.burst_count = 0
+        self.last_burst_reset = datetime.now()
+
+    def _cleanup_old_requests(self):
+        """Remove requests older than tracking windows"""
+        now = datetime.now()
+        cutoff_minute = now - timedelta(minutes=1)
+        cutoff_hour = now - timedelta(hours=1)
+        cutoff_day = now - timedelta(days=1)
+
+        # Clean up request queues
+        while self.minute_requests and self.minute_requests[0] < cutoff_minute:
+            self.minute_requests.popleft()
+        while self.hour_requests and self.hour_requests[0] < cutoff_hour:
+            self.hour_requests.popleft()
+        while self.day_requests and self.day_requests[0] < cutoff_day:
+            self.day_requests.popleft()
+        while self.minute_tokens and self.minute_tokens[0][0] < cutoff_minute:
+            self.minute_tokens.popleft()
+
+    def _estimate_tokens(self, text: str) -> int:
+        """Rough token estimation (words * 1.3 for subwords)"""
+        return max(1, int(len(text.split()) * 1.3))
+
+    def can_make_request(self, estimated_tokens: int = 100) -> bool:
+        """Check if we can make a request without violating rate limits"""
+        with self.lock:
+            now = datetime.now()
+
+            # Check cooldown period
+            if self.cooldown_until and now < self.cooldown_until:
+                remaining = (self.cooldown_until - now).total_seconds()
+                logger.warning(f"Rate limit cooldown active. Wait {remaining:.1f} seconds.")
+                return False
+
+            # Reset burst counter if needed
+            if (now - self.last_burst_reset).total_seconds() > 60:
+                self.burst_count = 0
+                self.last_burst_reset = now
+
+            # Clean up old requests
+            self._cleanup_old_requests()
+
+            # Check limits
+            minute_count = len(self.minute_requests)
+            hour_count = len(self.hour_requests)
+            day_count = len(self.day_requests)
+
+            # Check token usage
+            minute_token_usage = sum(tokens for _, tokens in self.minute_tokens)
+
+            # Apply limits with safety margins (very conservative)
+            if minute_count >= self.config.requests_per_minute * 0.7:  # 70% of limit
+                logger.warning(f"Approaching minute limit: {minute_count}/{self.config.requests_per_minute}")
+                return False
+
+            if hour_count >= self.config.requests_per_hour * 0.6:  # 60% of limit
+                logger.warning(f"Approaching hour limit: {hour_count}/{self.config.requests_per_hour}")
+                return False
+
+            if day_count >= self.config.requests_per_day * 0.5:  # 50% of limit
+                logger.warning(f"Approaching day limit: {day_count}/{self.config.requests_per_day}")
+                return False
+
+            if minute_token_usage + estimated_tokens >= self.config.tokens_per_minute * 0.8:
+                logger.warning(f"Approaching token limit: {minute_token_usage}/{self.config.tokens_per_minute}")
+                return False
+
+            # Check burst limit
+            if self.burst_count >= self.config.burst_limit:
+                logger.warning(f"Burst limit reached: {self.burst_count}/{self.config.burst_limit}")
+                return False
+
+            return True
+
+    def record_request(self, estimated_tokens: int = 100):
+        """Record a successful request"""
+        with self.lock:
+            now = datetime.now()
+            self.minute_requests.append(now)
+            self.hour_requests.append(now)
+            self.day_requests.append(now)
+            self.minute_tokens.append((now, estimated_tokens))
+            self.burst_count += 1
+
+    def record_rate_limit_hit(self):
+        """Record when we hit a rate limit"""
+        with self.lock:
+            now = datetime.now()
+            self.last_rate_limit_hit = now
+            self.cooldown_until = now + timedelta(seconds=self.config.cooldown_period)
+            logger.warning(f"Rate limit hit! Cooling down until {self.cooldown_until}")
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get current rate limiting status"""
+        with self.lock:
+            self._cleanup_old_requests()
+            now = datetime.now()
+
+            return {
+                "minute_requests": len(self.minute_requests),
+                "hour_requests": len(self.hour_requests),
+                "day_requests": len(self.day_requests),
+                "minute_tokens": sum(tokens for _, tokens in self.minute_tokens),
+                "burst_count": self.burst_count,
+                "cooldown_active": self.cooldown_until and now < self.cooldown_until,
+                "cooldown_remaining": (self.cooldown_until - now).total_seconds() if self.cooldown_until and now < self.cooldown_until else 0
+            }
 
 class GeminiAPI:
-    """Interface for Google's Gemini 2.5 Flash API"""
+    """Interface for Google's Gemini 2.5 Flash API with rate limiting"""
 
     def __init__(self, config: GeminiConfig):
         self.config = config
@@ -33,10 +180,27 @@ class GeminiAPI:
         self.session.headers.update({
             "Content-Type": "application/json",
         })
+        self.rate_limiter = RateLimiter(config.rate_limit)
 
     def _make_request(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Make a request to Gemini API with retry logic"""
+        """Make a request to Gemini API with rate limiting and retry logic"""
         url = f"{self.config.base_url}/models/{self.config.model}:generateContent?key={self.config.api_key}"
+
+        # Estimate tokens for rate limiting
+        prompt_text = ""
+        if 'contents' in payload and payload['contents']:
+            for content in payload['contents']:
+                if 'parts' in content:
+                    for part in content['parts']:
+                        if 'text' in part:
+                            prompt_text += part['text']
+
+        estimated_tokens = self.rate_limiter._estimate_tokens(prompt_text)
+
+        # Check if we can make the request
+        if not self.rate_limiter.can_make_request(estimated_tokens):
+            logger.warning("Rate limit check failed - skipping request")
+            return None
 
         for attempt in range(self.config.max_retries):
             try:
@@ -45,7 +209,19 @@ class GeminiAPI:
                     json=payload,
                     timeout=self.config.request_timeout
                 )
+
+                # Handle rate limiting responses
+                if response.status_code == 429:  # Too Many Requests
+                    self.rate_limiter.record_rate_limit_hit()
+                    wait_time = min(300, self.config.retry_delay * (2 ** attempt))  # Max 5 minutes
+                    logger.warning(f"Rate limit hit! Waiting {wait_time} seconds before retry.")
+                    time.sleep(wait_time)
+                    continue
+
                 response.raise_for_status()
+
+                # Record successful request
+                self.rate_limiter.record_request(estimated_tokens)
 
                 result = response.json()
                 if 'candidates' in result and result['candidates']:
@@ -84,6 +260,10 @@ class GeminiAPI:
             }
 
         return self._make_request(payload)
+
+    def get_rate_limit_status(self) -> Dict[str, Any]:
+        """Get current rate limiting status"""
+        return self.rate_limiter.get_status()
 
 class DataGenerator:
     """Generate training data using Gemini API for various modalities"""
